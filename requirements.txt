@@ -1,0 +1,7 @@
+numpy
+opencv-python
+open3d
+pyrealsense2
+ultralytics
+PySide6
+PyOpenGL
