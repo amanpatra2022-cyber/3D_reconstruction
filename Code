@@ -1,0 +1,1234 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+RealSense 3D Reconstruction Studio  (single-file application)
+=============================================================
+Intel RealSense D405 -> YOLO bottle segmentation -> RGB-D tracking (odometry + ICP)
+-> pose graph -> TSDF fusion -> triangle mesh -> synchronized CAD-like inspection.
+
+Units / conventions
+-------------------
+* All geometry is in METERS (export dialog can scale to millimetres).
+* Scan world frame  = camera frame of the first accepted keyframe
+  (RealSense convention: +X right, +Y down, +Z forward).
+* Inspection/model frame = world frame rotated 180 deg about X (so +Y is up in the
+  first view, +Z points toward the viewer) and translated so the mesh bounding-box
+  centre is the origin. Mesh and point cloud share this frame. Exports use it.
+"""
+from __future__ import annotations
+
+import sys, os, json, time, math, threading, traceback, enum, dataclasses
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+
+# Import order matters on Windows: torch/ultralytics before open3d before Qt.
+try:
+    from ultralytics import YOLO
+except Exception as _e:          # noqa
+    YOLO = None; _YOLO_ERR = str(_e)
+else:
+    _YOLO_ERR = ""
+import numpy as np
+import cv2
+try:
+    import open3d as o3d
+except Exception as _e:          # noqa
+    o3d = None
+try:
+    import pyrealsense2 as rs
+except Exception as _e:          # noqa
+    rs = None
+
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
+from PySide6.QtGui import (QImage, QPixmap, QSurfaceFormat, QPalette, QColor, QAction,
+                           QKeySequence, QShortcut)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                               QLabel, QPushButton, QGroupBox, QFormLayout, QDoubleSpinBox,
+                               QSpinBox, QLineEdit, QFileDialog, QMessageBox, QProgressBar,
+                               QPlainTextEdit, QSplitter, QTabWidget, QCheckBox, QComboBox,
+                               QSlider, QScrollArea, QSizePolicy, QGridLayout)
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
+
+try:
+    from OpenGL import GL as gl
+    from OpenGL import GLU as glu
+except Exception:                # noqa
+    gl = glu = None
+
+APP_TITLE = "RealSense 3D Reconstruction Studio"
+FLIP = np.diag([1.0, -1.0, -1.0, 1.0])
+
+
+# =====================================================================================
+# Settings, data containers
+# =====================================================================================
+@dataclass
+class Settings:
+    yolo_weights: str = "yolov8n-seg.pt"
+    yolo_conf: float = 0.35
+    infer_interval_ms: int = 100          # idle detection period (scanning runs as fast as possible)
+    depth_min_m: float = 0.07             # D405 minimum sensible range
+    depth_max_m: float = 0.50
+    live_voxel_mm: float = 2.0
+    recon_voxel_mm: float = 1.0
+    kf_angle_deg: float = 8.0
+    kf_trans_cm: float = 2.0
+    max_keyframes: int = 150
+    min_object_px: int = 2000
+    min_fitness: float = 0.30
+    export_units: str = "m"
+
+
+@dataclass
+class Frame:
+    seq: int
+    ts: float
+    color: np.ndarray        # BGR uint8
+    depth: np.ndarray        # uint16 raw z16 aligned to colour
+    intr: dict
+    units: float             # meters per depth unit
+
+
+class FrameHub:
+    def __init__(self):
+        self.lock = threading.Lock(); self.latest: Optional[Frame] = None
+    def put(self, f: Frame):
+        with self.lock: self.latest = f
+    def get_after(self, seq: int) -> Optional[Frame]:
+        with self.lock:
+            f = self.latest
+        return f if (f is not None and f.seq > seq) else None
+    def peek(self) -> Optional[Frame]:
+        with self.lock: return self.latest
+
+
+@dataclass
+class Detection:
+    box: Tuple[float, float, float, float]
+    conf: float
+    poly: np.ndarray
+    centroid: Tuple[float, float]
+
+
+@dataclass
+class DetectionResult:
+    seq: int
+    dets: List[Detection]
+    target: Optional[int]
+    distance_m: Optional[float]
+    valid_px: int
+    message: str
+
+
+@dataclass
+class Keyframe:
+    color_rgb: np.ndarray
+    depth_obj: np.ndarray    # uint16, zero outside the segmented object
+    pose: np.ndarray         # camera->world (4x4)
+    fitness: float
+    ts: float
+    valid_px: int
+
+
+class ScanState(enum.Enum):
+    IDLE = "Idle"; SCANNING = "Scanning"; PAUSED = "Paused"; CAPTURED = "Captured (locked)"
+    RECONSTRUCTING = "Reconstructing"; DONE = "Done"
+
+
+class ScanSession:
+    """Shared between GUI and perception thread; all mutation under `lock`."""
+    def __init__(self):
+        self.lock = threading.RLock(); self.generation = 0; self.intr = None; self.units = 1e-4
+        self.reset()
+    def reset(self):
+        with self.lock:
+            self.state = ScanState.IDLE; self.keyframes: List[Keyframe] = []
+            self.generation += 1; self.seen = 0; self.rej_track = 0; self.rej_quality = 0
+            self.status = "No scan"; self.last_fitness = 0.0
+
+
+@dataclass
+class ReconResult:
+    mesh: "o3d.geometry.TriangleMesh"
+    cloud: "o3d.geometry.PointCloud"
+    stats: dict
+    model_transform: np.ndarray
+
+
+# =====================================================================================
+# Geometry helpers
+# =====================================================================================
+def o3d_intr(i: dict):
+    return o3d.camera.PinholeCameraIntrinsic(int(i["w"]), int(i["h"]), i["fx"], i["fy"], i["cx"], i["cy"])
+
+
+def backproject(depth, intr, units, valid, color_rgb=None):
+    ys, xs = np.nonzero(valid)
+    z = depth[ys, xs].astype(np.float64) * units
+    x = (xs - intr["cx"]) / intr["fx"] * z
+    y = (ys - intr["cy"]) / intr["fy"] * z
+    pts = np.stack([x, y, z], 1)
+    cols = color_rgb[ys, xs].astype(np.float64) / 255.0 if color_rgb is not None else None
+    return pts, cols
+
+
+def make_cloud(pts, cols=None):
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(np.ascontiguousarray(pts, dtype=np.float64))
+    if cols is not None:
+        pc.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(cols, dtype=np.float64))
+    return pc
+
+
+def clean_depth(depth, units, dmin, dmax):
+    """Range-gate and remove flying pixels (depth edges) using a median consistency test."""
+    d = depth.copy()
+    d[(d < int(dmin / units)) | (d > int(dmax / units))] = 0
+    med = cv2.medianBlur(d, 5)
+    bad = (d > 0) & (np.abs(d.astype(np.int32) - med.astype(np.int32)) > max(1, int(0.008 / units)))
+    d[bad] = 0
+    return d
+
+
+def poly_mask(poly, shape):
+    m = np.zeros(shape[:2], np.uint8); cv2.fillPoly(m, [poly], 255); return m
+
+
+def rel_motion(T):
+    ang = math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(T[:3, :3]) - 1) / 2))))
+    return ang, float(np.linalg.norm(T[:3, 3]))
+
+
+def prep_cloud(pts, cols, voxel, normals=True):
+    pc = make_cloud(pts, cols)
+    if len(pc.points) == 0: return pc
+    pc = pc.voxel_down_sample(voxel)
+    if len(pc.points) > 30:
+        pc, _ = pc.remove_statistical_outlier(16, 2.0)
+    if normals and len(pc.points) > 10:
+        pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel * 4, 30))
+    return pc
+
+
+def colorize_depth(depth, units, dmin, dmax):
+    z = depth.astype(np.float32) * units
+    t = np.clip((z - dmin) / max(1e-6, dmax - dmin), 0, 1)
+    img = cv2.applyColorMap((t * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    img[depth == 0] = 0
+    return img
+
+
+def draw_overlay(color, res: Optional[DetectionResult], state: ScanState):
+    img = color.copy()
+    if res is not None:
+        layer = img.copy()
+        for i, d in enumerate(res.dets):
+            is_t = (i == res.target)
+            col = (0, 220, 120) if is_t else (150, 150, 150)
+            if is_t: cv2.fillPoly(layer, [d.poly], col)
+            cv2.polylines(img, [d.poly], True, col, 2)
+            x1, y1 = int(d.box[0]), int(d.box[1])
+            cv2.putText(img, f"bottle {d.conf:.2f}" + (" [target]" if is_t else ""), (x1, max(14, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+        img = cv2.addWeighted(layer, 0.3, img, 0.7, 0)
+        if res.distance_m:
+            cv2.putText(img, f"{res.distance_m*100:.1f} cm", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(img, state.value, (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (255, 255, 255), 2, cv2.LINE_AA)
+    return img
+
+
+# =====================================================================================
+# Camera thread (the ONLY owner of the RealSense pipeline)
+# =====================================================================================
+class CameraThread(QThread):
+    status = Signal(str, bool)
+
+    def __init__(self, hub: FrameHub):
+        super().__init__(); self.hub = hub; self._stop = False; self.seq = 0
+        self.intr = None; self.units = 1e-4; self.dropped = 0
+
+    def stop(self): self._stop = True
+
+    def run(self):
+        if rs is None:
+            self.status.emit("pyrealsense2 not installed", False); return
+        while not self._stop:
+            pipe = None
+            try:
+                pipe = self._open()
+                self._loop(pipe)
+            except Exception as e:
+                self.status.emit(f"Camera unavailable: {e}  (retrying)", False)
+            finally:
+                try:
+                    if pipe is not None: pipe.stop()
+                except Exception: pass
+            for _ in range(20):
+                if self._stop: break
+                self.msleep(100)
+
+    def _open(self):
+        ctx = rs.context(); devs = ctx.query_devices()
+        if len(devs) == 0: raise RuntimeError("no RealSense device found")
+        dev = devs[0]; name = dev.get_info(rs.camera_info.name); sn = dev.get_info(rs.camera_info.serial_number)
+        last = None; prof = None; pipe = None
+        for (w, h) in [(848, 480), (640, 480), (1280, 720)]:
+            pipe = rs.pipeline(ctx); cfg = rs.config(); cfg.enable_device(sn)
+            cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, 30)
+            cfg.enable_stream(rs.stream.color, w, h, rs.format.bgr8, 30)
+            try:
+                prof = pipe.start(cfg); break
+            except RuntimeError as e:
+                last = e; prof = None
+        if prof is None: raise RuntimeError(f"cannot start streams: {last}")
+        self.units = prof.get_device().first_depth_sensor().get_depth_scale()
+        i = prof.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.intr = dict(w=i.width, h=i.height, fx=i.fx, fy=i.fy, cx=i.ppx, cy=i.ppy)
+        self.align = rs.align(rs.stream.color)
+        warn = "" if "405" in name else "  (WARNING: not a D405)"
+        self.status.emit(f"Connected: {name} S/N {sn}  {i.width}x{i.height}@30  depth unit {self.units*1e6:.0f} um{warn}", True)
+        return pipe
+
+    def _loop(self, pipe):
+        while not self._stop:
+            frames = pipe.wait_for_frames(5000)       # raises RuntimeError on disconnect
+            frames = self.align.process(frames)
+            d = frames.get_depth_frame(); c = frames.get_color_frame()
+            if not d or not c:
+                self.dropped += 1; continue
+            self.seq += 1
+            self.hub.put(Frame(self.seq, time.time(), np.asanyarray(c.get_data()).copy(),
+                               np.asanyarray(d.get_data()).copy(), self.intr, self.units))
+
+
+# =====================================================================================
+# Perception thread: YOLO detection/segmentation + live cloud + scan tracking
+# =====================================================================================
+class PerceptionWorker(QThread):
+    detections = Signal(object)
+    live_cloud = Signal(object, object)
+    scan_update = Signal(dict)
+    status = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, hub: FrameHub, session: ScanSession, settings: Settings):
+        super().__init__()
+        self.hub, self.session, self.s = hub, session, settings
+        self._stop = False; self.reload = True; self.model = None; self.cls_ids = [39]
+        self.device = "cpu"; self.select_point = None; self.prev_centroid = None
+        self.gen = -1; self._reset_ref()
+
+    def stop(self): self._stop = True
+    def _reset_ref(self): self.ref_rgbd = None; self.ref_cloud = None; self.ref_pose = None
+
+    # ---- model -----------------------------------------------------------------------
+    def _load_model(self):
+        if YOLO is None: raise RuntimeError(f"ultralytics unavailable: {_YOLO_ERR}")
+        self.status.emit(f"Loading YOLO model {self.s.yolo_weights} (first run may download it)...")
+        try:
+            import torch
+            self.device = 0 if torch.cuda.is_available() else "cpu"
+        except Exception: self.device = "cpu"
+        self.model = YOLO(self.s.yolo_weights)
+        names = self.model.names
+        ids = [k for k, v in names.items() if v == "bottle"]
+        self.cls_ids = ids or [39]
+        self.status.emit(f"YOLO ready on {'GPU' if self.device == 0 else 'CPU'}")
+
+    def _detect(self, color) -> List[Detection]:
+        if self.model is None: return []
+        r = self.model.predict(color, conf=self.s.yolo_conf, classes=self.cls_ids, imgsz=640,
+                               device=self.device, verbose=False)[0]
+        out = []
+        if r.boxes is None or len(r.boxes) == 0 or r.masks is None: return out
+        for i, b in enumerate(r.boxes):
+            poly = r.masks.xy[i]
+            if poly is None or len(poly) < 3: continue
+            poly = np.round(poly).astype(np.int32)
+            cx, cy = poly.mean(0)
+            out.append(Detection(tuple(b.xyxy[0].tolist()), float(b.conf[0]), poly, (float(cx), float(cy))))
+        return out
+
+    def _pick(self, dets, scanning) -> Optional[int]:
+        if not dets: return None
+        sp = self.select_point
+        if sp is not None:
+            self.select_point = None
+            best = None
+            for i, d in enumerate(dets):
+                if cv2.pointPolygonTest(d.poly.astype(np.float32), (float(sp[0]), float(sp[1])), False) >= 0: best = i
+            if best is None:
+                best = int(np.argmin([math.hypot(d.centroid[0] - sp[0], d.centroid[1] - sp[1]) for d in dets]))
+            self.prev_centroid = dets[best].centroid; return best
+        if self.prev_centroid is not None:
+            dist = [math.hypot(d.centroid[0] - self.prev_centroid[0], d.centroid[1] - self.prev_centroid[1]) for d in dets]
+            j = int(np.argmin(dist))
+            if dist[j] < 160: self.prev_centroid = dets[j].centroid; return j
+            if scanning: return None
+        j = int(np.argmax([d.conf for d in dets])); self.prev_centroid = dets[j].centroid; return j
+
+    # ---- main loop -------------------------------------------------------------------
+    def run(self):
+        last_seq = 0; last_infer = 0.0; self._last_cloud = 0.0; last_err = 0.0
+        while not self._stop:
+            if self.reload:
+                self.reload = False
+                try: self._load_model()
+                except Exception as e: self.model = None; self.error.emit(f"Detection disabled: {e}")
+            st = self.session.state
+            if st == ScanState.RECONSTRUCTING: self.msleep(100); continue
+            f = self.hub.get_after(last_seq)
+            if f is None: self.msleep(4); continue
+            scanning = st == ScanState.SCANNING
+            now = time.time()
+            if not scanning and (now - last_infer) * 1000 < self.s.infer_interval_ms: self.msleep(4); continue
+            last_seq = f.seq; last_infer = now
+            try: self._process(f, scanning)
+            except Exception:
+                if time.time() - last_err > 3:
+                    last_err = time.time(); self.error.emit("Processing error:\n" + traceback.format_exc())
+
+    def _process(self, f: Frame, scanning: bool):
+        s = self.s
+        dets = self._detect(f.color)
+        t = self._pick(dets, scanning)
+        res = DetectionResult(f.seq, dets, t, None, 0, "")
+        if self.model is None: res.message = "Detection unavailable (see log)"
+        elif not dets: res.message = "No bottle detected"
+        elif t is None: res.message = "Target bottle lost"
+        if t is not None:
+            clean = clean_depth(f.depth, f.units, s.depth_min_m, s.depth_max_m)
+            mask = cv2.erode(poly_mask(dets[t].poly, f.color.shape), np.ones((5, 5), np.uint8))
+            valid = (mask > 0) & (clean > 0)
+            res.valid_px = int(valid.sum())
+            if res.valid_px > 50:
+                res.distance_m = float(np.median(clean[valid]) * f.units)
+            else: res.message = "No valid depth on target"
+            rgb = cv2.cvtColor(f.color, cv2.COLOR_BGR2RGB)
+            if time.time() - self._last_cloud > 0.5 and res.valid_px > 50:
+                self._last_cloud = time.time()
+                p, c = backproject(clean, f.intr, f.units, valid, rgb)
+                pc = prep_cloud(p, c, s.live_voxel_mm / 1000.0, normals=False)
+                self.live_cloud.emit(np.asarray(pc.points, np.float32), np.asarray(pc.colors, np.float32))
+            if scanning: self._track(f, clean, valid, rgb, res)
+        elif scanning:
+            self._note("Target lost - point the camera at the bottle", reject="track")
+        self.detections.emit(res)
+
+    # ---- tracking --------------------------------------------------------------------
+    def _note(self, msg, reject=None):
+        with self.session.lock:
+            self.session.status = msg
+            if reject == "track": self.session.rej_track += 1
+            if reject == "quality": self.session.rej_quality += 1
+        self._emit_scan()
+
+    def _emit_scan(self):
+        se = self.session
+        self.scan_update.emit(dict(seen=se.seen, accepted=len(se.keyframes), rej_track=se.rej_track,
+                                   rej_quality=se.rej_quality, status=se.status, fitness=se.last_fitness))
+
+    def _track(self, f, clean, valid, rgb, res):
+        se, s = self.session, self.s
+        if se.generation != self.gen: self._reset_ref(); self.gen = se.generation
+        with se.lock: se.seen += 1; se.intr = f.intr; se.units = f.units
+        if res.valid_px < s.min_object_px:
+            self._note(f"Too few valid object depth pixels ({res.valid_px} < {s.min_object_px})", "quality"); return
+        K = o3d_intr(f.intr)
+        depth_obj = np.where(valid, clean, 0).astype(np.uint16)
+        p, c = backproject(depth_obj, f.intr, f.units, depth_obj > 0, rgb)
+        cloud = prep_cloud(p, c, 0.003)
+        if len(cloud.points) < 200: self._note("Object cloud too sparse", "quality"); return
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(np.ascontiguousarray(rgb)), o3d.geometry.Image(np.ascontiguousarray(clean)),
+            depth_scale=1.0 / f.units, depth_trunc=s.depth_max_m, convert_rgb_to_intensity=True)
+        if self.ref_rgbd is None:
+            self._accept(rgb, depth_obj, np.eye(4), 1.0, res.valid_px, rgbd, cloud, "First keyframe stored"); return
+        # 1) RGB-D hybrid odometry current -> reference keyframe (whole scene gives constraints
+        #    that a symmetric bottle alone cannot, e.g. rotation about its axis)
+        T = None; mode = ""
+        try:
+            opt = o3d.pipelines.odometry.OdometryOption()
+            opt.depth_min = s.depth_min_m; opt.depth_max = s.depth_max_m; opt.depth_diff_max = 0.02
+            ok, Tod, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
+                rgbd, self.ref_rgbd, K, np.eye(4),
+                o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(), opt)
+            if ok: T = Tod; mode = "RGB-D odometry"
+        except Exception: ok = False
+        if T is None: T = np.eye(4); mode = "ICP only"
+        ang, tr = rel_motion(T)
+        if ang > 45 or tr > 0.20:
+            self._note(f"Tracking jump rejected ({ang:.0f} deg, {tr*100:.0f} cm) - move slower / return to last view", "track"); return
+        # 2) ICP refinement on the object, guarded so it can't slide along the bottle axis
+        reg = o3d.pipelines.registration
+        try:
+            r = reg.registration_icp(cloud, self.ref_cloud, 0.008, T, reg.TransformationEstimationPointToPlane(),
+                                     reg.ICPConvergenceCriteria(max_iteration=30))
+            dA, dT = rel_motion(np.linalg.inv(T) @ r.transformation)
+            if dA < 6 and dT < 0.02 and r.fitness > 0.1:
+                T = r.transformation; mode += " + ICP"
+        except Exception: pass
+        ev = reg.evaluate_registration(cloud, self.ref_cloud, 0.01, T)
+        if ev.fitness < s.min_fitness or ev.inlier_rmse > 0.006:
+            self._note(f"Poor registration (fitness {ev.fitness:.2f}, rmse {ev.inlier_rmse*1000:.1f} mm) - frame rejected", "track"); return
+        ang, tr = rel_motion(T)
+        if ang < s.kf_angle_deg and tr * 100 < s.kf_trans_cm:
+            self._note(f"Tracking OK ({mode}, fitness {ev.fitness:.2f}) - keep moving around the bottle")
+            with se.lock: se.last_fitness = ev.fitness
+            return
+        pose = self.ref_pose @ T
+        self._accept(rgb, depth_obj, pose, ev.fitness, res.valid_px, rgbd, cloud, f"Keyframe added ({mode})")
+
+    def _accept(self, rgb, depth_obj, pose, fit, npx, rgbd, cloud, msg):
+        se = self.session
+        with se.lock:
+            if se.state != ScanState.SCANNING or se.generation != self.gen: return
+            if len(se.keyframes) >= self.s.max_keyframes:
+                se.status = "Maximum keyframes reached"; self._emit_scan(); return
+            se.keyframes.append(Keyframe(rgb.copy(), depth_obj, pose.copy(), float(fit), time.time(), int(npx)))
+            se.last_fitness = fit; se.status = msg
+        self.ref_rgbd, self.ref_cloud, self.ref_pose = rgbd, cloud, pose.copy()
+        self._emit_scan()
+
+
+# =====================================================================================
+# Scan review
+# =====================================================================================
+def review_keyframes(kfs: List[Keyframe], intr, units, s: Settings):
+    msgs = []; info = {}
+    n = len(kfs); info["keyframes"] = n
+    if n < 3:
+        msgs.append(("error", f"Only {n} accepted keyframes; at least 3 are required (12+ recommended)."))
+        return msgs, info
+    if n < 12: msgs.append(("warn", f"Only {n} keyframes - coverage is probably insufficient (12+ recommended)."))
+    cents = []
+    for k in kfs:
+        p, _ = backproject(k.depth_obj[::4, ::4], dict(cx=intr["cx"] / 4, cy=intr["cy"] / 4, fx=intr["fx"] / 4,
+                           fy=intr["fy"] / 4), units, k.depth_obj[::4, ::4] > 0)
+        if len(p): cents.append((k.pose @ np.append(p.mean(0), 1))[:3])
+    obj = np.median(np.array(cents), 0)
+    C = np.array([k.pose[:3, 3] for k in kfs]); v = C - obj
+    vm = v - v.mean(0); _, sv, vt = np.linalg.svd(vm)
+    if sv[1] < 0.1 * max(sv[0], 1e-9):
+        msgs.append(("warn", "Camera path is almost a straight line - the bottle was not orbited; coverage estimate unreliable."))
+    nrm = vt[2]; e1 = v[0] - nrm * (v[0] @ nrm); e1 /= np.linalg.norm(e1) + 1e-12; e2 = np.cross(nrm, e1)
+    ang = np.degrees(np.arctan2(v @ e2, v @ e1)) % 360
+    hist = np.histogram(ang, bins=12, range=(0, 360))[0]
+    empty = [i for i in range(12) if hist[i] == 0]
+    info["azimuth_coverage_pct"] = round(100 * (12 - len(empty)) / 12, 1)
+    if empty:
+        msgs.append(("warn", "No views in azimuth sectors (deg from start): " + ", ".join(f"{i*30}-{i*30+30}" for i in empty) + "."))
+    h = v @ nrm; rad = np.linalg.norm(v - np.outer(h, nrm), axis=1)
+    el = np.degrees(np.arctan2(h, rad)); info["elevation_range_deg"] = round(float(el.max() - el.min()), 1)
+    if el.max() - el.min() < 20: msgs.append(("warn", "Little elevation variation: top of the bottle / neck may be unobserved."))
+    steps = [rel_motion(np.linalg.inv(kfs[i].pose) @ kfs[i + 1].pose)[0] for i in range(n - 1)]
+    if max(steps) > 25: msgs.append(("warn", f"Largest rotation between consecutive keyframes is {max(steps):.0f} deg - overlap may be insufficient."))
+    fit = [k.fitness for k in kfs[1:]]; info["mean_fitness"] = round(float(np.mean(fit)), 2)
+    if min(fit) < 0.4: msgs.append(("warn", f"Weakest registration overlap fitness is {min(fit):.2f}."))
+    px = [k.valid_px for k in kfs]; info["min_valid_px"] = int(min(px))
+    if min(px) < 4000: msgs.append(("warn", f"Some keyframes have few valid depth pixels (min {min(px)}); depth may be unreliable (reflective/transparent surface?)."))
+    msgs.append(("info", "The surface the bottle rests on hides its base: the bottom cannot be reconstructed unless the bottle is re-posed (not supported)."))
+    if not any(m[0] == "warn" for m in msgs): msgs.insert(0, ("info", "No coverage problems detected by automatic checks (this does not guarantee completeness)."))
+    return msgs, info
+
+
+# =====================================================================================
+# Reconstruction worker
+# =====================================================================================
+class Cancelled(Exception): pass
+
+
+class ReconWorker(QThread):
+    progress = Signal(str, float)
+    finished_ok = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, kfs, intr, units, settings: Settings):
+        super().__init__(); self.kfs = kfs; self.intr = intr; self.units = units
+        self.s = dataclasses.replace(settings); self._cancel = False
+
+    def cancel(self): self._cancel = True
+    def _chk(self):
+        if self._cancel: raise Cancelled()
+
+    def run(self):
+        try: self.finished_ok.emit(self._run())
+        except Cancelled: self.cancelled.emit()
+        except Exception: self.failed.emit(traceback.format_exc())
+
+    def _p(self, stage, base, weight, i, n):      # fixed stage allocation x real completed fraction
+        self.progress.emit(stage, base + weight * (i / max(1, n)))
+
+    def _run(self) -> ReconResult:
+        s, kfs, intr, units = self.s, self.kfs, self.intr, self.units
+        reg = o3d.pipelines.registration; n = len(kfs); K = o3d_intr(intr)
+        voxel = s.recon_voxel_mm / 1000.0; stats = {}
+        # 1. per-keyframe clouds
+        clouds = []
+        for i, k in enumerate(kfs):
+            self._chk(); self._p("Building per-view point clouds", 0.0, 0.15, i, n)
+            p, c = backproject(k.depth_obj, intr, units, k.depth_obj > 0, k.color_rgb)
+            clouds.append(prep_cloud(p, c, 0.003))
+        # 2. pose graph with loop closures
+        poses = [k.pose.copy() for k in kfs]
+        pg = reg.PoseGraph()
+        for P in poses: pg.nodes.append(reg.PoseGraphNode(P))
+        for i in range(n - 1):
+            T = np.linalg.inv(poses[i + 1]) @ poses[i]
+            pg.edges.append(reg.PoseGraphEdge(i, i + 1, T, reg.get_information_matrix_from_point_clouds(
+                clouds[i], clouds[i + 1], 0.01, T), uncertain=False))
+        cand = []
+        for i in range(n):
+            for j in range(i + 6, n):
+                d = np.linalg.norm(poses[i][:3, 3] - poses[j][:3, 3]); cosv = poses[i][:3, 2] @ poses[j][:3, 2]
+                if d < 0.15 and cosv > math.cos(math.radians(50)): cand.append((d, i, j))
+        cand.sort(); cand = cand[:80]; loops = 0
+        for q, (_, i, j) in enumerate(cand):
+            self._chk(); self._p("Searching loop closures", 0.15, 0.15, q, len(cand))
+            T0 = np.linalg.inv(poses[j]) @ poses[i]
+            r = reg.registration_icp(clouds[i], clouds[j], 0.01, T0, reg.TransformationEstimationPointToPlane(),
+                                     reg.ICPConvergenceCriteria(max_iteration=50))
+            dA, dT = rel_motion(np.linalg.inv(T0) @ r.transformation)
+            if r.fitness > 0.45 and r.inlier_rmse < 0.003 and dA < 10 and dT < 0.03:
+                pg.edges.append(reg.PoseGraphEdge(i, j, r.transformation, reg.get_information_matrix_from_point_clouds(
+                    clouds[i], clouds[j], 0.01, r.transformation), uncertain=True)); loops += 1
+        stats["loop_closures"] = loops
+        if loops:
+            self.progress.emit("Optimising pose graph", 0.30, 0.0); self._chk()
+            reg.global_optimization(pg, reg.GlobalOptimizationLevenbergMarquardt(),
+                                    reg.GlobalOptimizationConvergenceCriteria(),
+                                    reg.GlobalOptimizationOption(max_correspondence_distance=0.01, edge_prune_threshold=0.25,
+                                                                 preference_loop_closure=2.0, reference_node=0))
+            opt = [np.array(nd.pose) for nd in pg.nodes]
+            stats["max_pose_correction_mm"] = round(max(np.linalg.norm(a[:3, 3] - b[:3, 3]) for a, b in zip(poses, opt)) * 1000, 2)
+            poses = opt
+        # 3. TSDF integration
+        vol = o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=voxel, sdf_trunc=max(4 * voxel, 0.004),
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
+        for i, k in enumerate(kfs):
+            self._chk(); self._p("Integrating TSDF volume", 0.30, 0.40, i, n)
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                o3d.geometry.Image(np.ascontiguousarray(k.color_rgb)), o3d.geometry.Image(np.ascontiguousarray(k.depth_obj)),
+                depth_scale=1.0 / units, depth_trunc=s.depth_max_m, convert_rgb_to_intensity=False)
+            vol.integrate(rgbd, K, np.linalg.inv(poses[i]))
+        # 4. mesh
+        self.progress.emit("Extracting mesh", 0.70, 0.0); self._chk()
+        mesh = vol.extract_triangle_mesh()
+        if len(mesh.triangles) == 0: raise RuntimeError("No surface could be extracted from the observations.")
+        mesh.remove_degenerate_triangles(); mesh.remove_duplicated_triangles(); mesh.remove_duplicated_vertices()
+        tc, nt, _ = mesh.cluster_connected_triangles(); tc = np.asarray(tc); nt = np.asarray(nt)
+        keep = nt >= 0.05 * nt.max()
+        mesh.remove_triangles_by_mask(~keep[tc]); mesh.remove_unreferenced_vertices(); mesh.compute_vertex_normals()
+        if len(mesh.triangles) == 0: raise RuntimeError("Mesh empty after cleanup.")
+        # 5. fused point cloud from the actual observations
+        self._chk(); acc = o3d.geometry.PointCloud()
+        for i, k in enumerate(kfs):
+            self._chk(); self._p("Fusing point cloud", 0.75, 0.2, i, n)
+            p, c = backproject(k.depth_obj, intr, units, k.depth_obj > 0, k.color_rgb)
+            pc = make_cloud(p, c).voxel_down_sample(voxel); pc.transform(poses[i]); acc += pc
+        acc = acc.voxel_down_sample(voxel)
+        acc, _ = acc.remove_statistical_outlier(20, 2.0)
+        # 6. model frame
+        mesh.transform(FLIP); acc.transform(FLIP)
+        c = mesh.get_axis_aligned_bounding_box().get_center(); Tc = np.eye(4); Tc[:3, 3] = -c
+        mesh.transform(Tc); acc.transform(Tc); mesh.compute_vertex_normals()
+        ext = mesh.get_axis_aligned_bounding_box().get_extent()
+        stats.update(keyframes=n, vertices=len(mesh.vertices), triangles=len(mesh.triangles), points=len(acc.points),
+                     bbox_mm=[round(float(x) * 1000, 1) for x in ext], voxel_mm=s.recon_voxel_mm,
+                     watertight=bool(mesh.is_watertight()), mean_fitness=round(float(np.mean([k.fitness for k in kfs[1:]])), 2))
+        self.progress.emit("Done", 1.0, 0.0)
+        return ReconResult(mesh, acc, stats, Tc @ FLIP)
+
+
+# =====================================================================================
+# 3D viewport (QOpenGLWidget, fixed-function OpenGL) with shared-capable orbit camera
+# =====================================================================================
+class OrbitCamera(QObject):
+    changed = Signal(); user_changed = Signal()
+    def __init__(self):
+        super().__init__(); self.az = math.radians(40); self.el = math.radians(25); self.dist = 0.8
+        self.target = np.zeros(3); self.fov = 45.0; self.radius = 0.2
+    def state(self): return (self.az, self.el, self.dist, self.target.copy(), self.fov, self.radius)
+    def set_state(self, st):
+        self.az, self.el, self.dist, t, self.fov, self.radius = st; self.target = np.array(t, float); self.changed.emit()
+    def eye(self):
+        return self.target + self.dist * np.array([math.cos(self.el) * math.cos(self.az), math.sin(self.el),
+                                                   math.cos(self.el) * math.sin(self.az)])
+    def basis(self):
+        f = self.target - self.eye(); f /= np.linalg.norm(f)
+        r = np.cross(f, [0, 1, 0]); r /= np.linalg.norm(r) + 1e-12
+        return r, np.cross(r, f)
+    def _u(self): self.changed.emit(); self.user_changed.emit()
+    def orbit(self, dx, dy):
+        self.az -= dx * 0.01; self.el = float(np.clip(self.el + dy * 0.01, -1.5533, 1.5533)); self._u()
+    def zoom(self, steps):
+        self.dist = float(np.clip(self.dist * 0.88 ** steps, self.radius * 0.2, self.radius * 40)); self._u()
+    def pan(self, dx, dy, h):
+        r, u = self.basis(); k = 2 * self.dist * math.tan(math.radians(self.fov / 2)) / max(1, h)
+        self.target = self.target + (-r * dx + u * dy) * k; self._u()
+    def fit(self, center, radius):
+        self.target = np.array(center, float); self.radius = max(radius, 1e-3)
+        self.dist = self.radius / math.sin(math.radians(self.fov / 2)) * 1.1; self.changed.emit()
+    def view(self, name, center, radius):
+        self.fit(center, radius)
+        self.az, self.el = {"front": (math.pi / 2, 0.0), "side": (0.0, 0.0), "top": (math.pi / 2, 1.5533),
+                            "iso": (math.radians(45), math.radians(35))}[name]
+        self.changed.emit()
+
+
+class GLViewport(QOpenGLWidget):
+    activated = Signal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cam = OrbitCamera(); self.cam.changed.connect(self.update)
+        self.P = None; self.Crgb = None; self.Cdepth = None; self.V = None; self.F = None; self.N = None; self.Cm = None
+        self.nlines = None; self.bmin = -np.ones(3) * 0.1; self.bmax = np.ones(3) * 0.1
+        self.point_size = 3.0; self.show_points = True; self.show_mesh = False; self.mesh_mode = "solid"
+        self.show_normals = False; self.show_axes = True; self.show_bbox = False; self.mesh_colored = False
+        self.depth_mode = False; self.user_touched = False; self._last = None
+        self.label = QLabel(self); self.label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.label.setStyleSheet("background:rgba(0,0,0,150);color:#d8e6f0;padding:4px;font:11px Consolas;")
+        self.label.move(8, 8); self.label.hide()
+
+    def set_info(self, text):
+        self.label.setText(text); self.label.setVisible(bool(text)); self.label.adjustSize()
+
+    def _bounds(self):
+        lo, hi = [], []
+        for A in (self.P, self.V):
+            if A is not None and len(A): lo.append(A.min(0)); hi.append(A.max(0))
+        if lo: self.bmin, self.bmax = np.min(lo, 0), np.max(hi, 0)
+    def center_radius(self):
+        return (self.bmin + self.bmax) / 2, max(1e-3, float(np.linalg.norm(self.bmax - self.bmin)) / 2)
+
+    def set_points(self, P, C):
+        self.P = np.ascontiguousarray(P, np.float32); self.Crgb = np.ascontiguousarray(C, np.float32)
+        if len(P) > 1:
+            z = P[:, 2]; lo, hi = np.percentile(z, [2, 98])
+            t = np.clip((z - lo) / (hi - lo + 1e-9), 0, 1)
+            col = cv2.applyColorMap((t * 255).astype(np.uint8).reshape(-1, 1), cv2.COLORMAP_TURBO)[:, 0, ::-1] / 255.0
+            self.Cdepth = np.ascontiguousarray(col, np.float32)
+        else: self.Cdepth = self.Crgb
+        self._bounds(); self.update()
+    def set_mesh(self, V, F, N, C):
+        self.V = np.ascontiguousarray(V, np.float32); self.F = np.ascontiguousarray(F, np.uint32)
+        self.N = np.ascontiguousarray(N, np.float32); self.Cm = np.ascontiguousarray(C, np.float32) if C is not None and len(C) == len(V) else None
+        step = max(1, len(V) // 3000); L = 0.03 * float(np.linalg.norm(V.max(0) - V.min(0)))
+        a = self.V[::step]; b = a + self.N[::step] * L
+        self.nlines = np.ascontiguousarray(np.stack([a, b], 1).reshape(-1, 3), np.float32)
+        self._bounds(); self.update()
+    def clear(self):
+        self.P = self.V = self.F = None; self.update()
+    def fit_view(self):
+        c, r = self.center_radius(); self.cam.fit(c, r)
+
+    # ---- GL ---------------------------------------------------------------------------
+    def initializeGL(self):
+        gl.glEnable(gl.GL_DEPTH_TEST); gl.glEnable(gl.GL_NORMALIZE); gl.glEnable(gl.GL_POINT_SMOOTH)
+        gl.glLightModeli(gl.GL_LIGHT_MODEL_TWO_SIDE, 1)
+    def paintGL(self):
+        gl.glClearColor(0.07, 0.08, 0.10, 1); gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        c = self.cam; w, h = max(1, self.width()), max(1, self.height())
+        gl.glMatrixMode(gl.GL_PROJECTION); gl.glLoadIdentity()
+        glu.gluPerspective(c.fov, w / h, max(1e-4, c.dist * 0.01), c.dist * 30 + c.radius * 10)
+        gl.glMatrixMode(gl.GL_MODELVIEW); gl.glLoadIdentity()
+        gl.glEnable(gl.GL_LIGHT0); gl.glLightfv(gl.GL_LIGHT0, gl.GL_POSITION, (0.3, 0.6, 1.0, 0.0))
+        gl.glLightfv(gl.GL_LIGHT0, gl.GL_DIFFUSE, (0.9, 0.9, 0.9, 1)); gl.glLightfv(gl.GL_LIGHT0, gl.GL_AMBIENT, (0.25, 0.25, 0.28, 1))
+        e = c.eye(); t = c.target; glu.gluLookAt(e[0], e[1], e[2], t[0], t[1], t[2], 0, 1, 0)
+        if self.show_axes: self._axes()
+        if self.show_mesh and self.V is not None and self.F is not None: self._mesh()
+        if self.show_points and self.P is not None and len(self.P): self._points()
+        if self.show_bbox: self._bbox()
+    def _points(self):
+        gl.glDisable(gl.GL_LIGHTING); gl.glPointSize(self.point_size)
+        gl.glEnableClientState(gl.GL_VERTEX_ARRAY); gl.glEnableClientState(gl.GL_COLOR_ARRAY)
+        gl.glVertexPointer(3, gl.GL_FLOAT, 0, self.P)
+        gl.glColorPointer(3, gl.GL_FLOAT, 0, self.Cdepth if self.depth_mode else self.Crgb)
+        gl.glDrawArrays(gl.GL_POINTS, 0, len(self.P))
+        gl.glDisableClientState(gl.GL_COLOR_ARRAY); gl.glDisableClientState(gl.GL_VERTEX_ARRAY)
+    def _mesh(self):
+        gl.glEnableClientState(gl.GL_VERTEX_ARRAY); gl.glVertexPointer(3, gl.GL_FLOAT, 0, self.V)
+        if self.mesh_mode in ("solid", "both"):
+            gl.glEnable(gl.GL_LIGHTING); gl.glEnableClientState(gl.GL_NORMAL_ARRAY); gl.glNormalPointer(gl.GL_FLOAT, 0, self.N)
+            gl.glEnable(gl.GL_COLOR_MATERIAL); gl.glColorMaterial(gl.GL_FRONT_AND_BACK, gl.GL_AMBIENT_AND_DIFFUSE)
+            if self.mesh_colored and self.Cm is not None:
+                gl.glEnableClientState(gl.GL_COLOR_ARRAY); gl.glColorPointer(3, gl.GL_FLOAT, 0, self.Cm)
+            else: gl.glColor3f(0.70, 0.74, 0.80)
+            if self.mesh_mode == "both": gl.glEnable(gl.GL_POLYGON_OFFSET_FILL); gl.glPolygonOffset(1.0, 1.0)
+            gl.glDrawElements(gl.GL_TRIANGLES, self.F.size, gl.GL_UNSIGNED_INT, self.F)
+            gl.glDisable(gl.GL_POLYGON_OFFSET_FILL); gl.glDisableClientState(gl.GL_COLOR_ARRAY)
+            gl.glDisableClientState(gl.GL_NORMAL_ARRAY); gl.glDisable(gl.GL_COLOR_MATERIAL)
+        if self.mesh_mode in ("wire", "both"):
+            gl.glDisable(gl.GL_LIGHTING); gl.glColor3f(0.2, 0.85, 1.0); gl.glLineWidth(1.0)
+            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE)
+            gl.glDrawElements(gl.GL_TRIANGLES, self.F.size, gl.GL_UNSIGNED_INT, self.F)
+            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
+        if self.show_normals and self.nlines is not None:
+            gl.glDisable(gl.GL_LIGHTING); gl.glColor3f(1.0, 0.8, 0.2)
+            gl.glVertexPointer(3, gl.GL_FLOAT, 0, self.nlines); gl.glDrawArrays(gl.GL_LINES, 0, len(self.nlines))
+        gl.glDisableClientState(gl.GL_VERTEX_ARRAY); gl.glDisable(gl.GL_LIGHTING)
+    def _axes(self):
+        gl.glDisable(gl.GL_LIGHTING); L = 0.6 * self.center_radius()[1]; gl.glLineWidth(2.5); gl.glBegin(gl.GL_LINES)
+        for col, d in (((1, .2, .2), (L, 0, 0)), ((.2, 1, .2), (0, L, 0)), ((.3, .5, 1), (0, 0, L))):
+            gl.glColor3f(*col); gl.glVertex3f(0, 0, 0); gl.glVertex3f(*d)
+        gl.glEnd(); gl.glLineWidth(1.0)
+    def _bbox(self):
+        gl.glDisable(gl.GL_LIGHTING); a, b = self.bmin, self.bmax; gl.glColor3f(1, 0.9, 0.2); gl.glBegin(gl.GL_LINES)
+        cs = [(x, y, z) for x in (a[0], b[0]) for y in (a[1], b[1]) for z in (a[2], b[2])]
+        for i in range(8):
+            for j in range(i + 1, 8):
+                if sum(cs[i][k] != cs[j][k] for k in range(3)) == 1: gl.glVertex3f(*cs[i]); gl.glVertex3f(*cs[j])
+        gl.glEnd()
+
+    # ---- mouse ------------------------------------------------------------------------
+    def mousePressEvent(self, e): self._last = e.position(); self.activated.emit()
+    def mouseMoveEvent(self, e):
+        if self._last is None: return
+        p = e.position(); dx, dy = p.x() - self._last.x(), p.y() - self._last.y(); self._last = p
+        self.user_touched = True
+        b = e.buttons()
+        if (b & Qt.LeftButton) and not (e.modifiers() & Qt.ShiftModifier): self.cam.orbit(dx, dy)
+        elif b & (Qt.RightButton | Qt.MiddleButton | Qt.LeftButton): self.cam.pan(dx, dy, self.height())
+    def wheelEvent(self, e):
+        self.user_touched = True; self.activated.emit(); self.cam.zoom(e.angleDelta().y() / 120.0)
+    def mouseDoubleClickEvent(self, e): self.fit_view(); self.cam.user_changed.emit()
+
+
+# =====================================================================================
+# Inspection workspace
+# =====================================================================================
+class InspectionTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.left, self.right = GLViewport(), GLViewport()
+        self.active = self.left; self.result: Optional[ReconResult] = None
+        self.left.show_points = False; self.left.show_mesh = True; self.left.show_axes = True
+        self.right.show_points = True; self.right.show_mesh = False
+        lay = QVBoxLayout(self)
+        bar = QHBoxLayout(); lay.addLayout(bar)
+        self.sync = QCheckBox("Sync View"); self.sync.setChecked(True); bar.addWidget(self.sync)
+        for name, label in (("front", "Front"), ("side", "Side"), ("top", "Top"), ("iso", "Isometric")):
+            b = QPushButton(label); b.clicked.connect(lambda _=False, n=name: self._view(n)); bar.addWidget(b)
+        bf = QPushButton("Fit to Model"); bf.clicked.connect(lambda: self._apply(lambda c: c.fit(*self.left.center_radius())))
+        br = QPushButton("Reset View"); br.clicked.connect(lambda: self._view("iso")); bar.addWidget(bf); bar.addWidget(br); bar.addStretch(1)
+        hint = QLabel("LMB orbit | RMB/MMB/Shift+LMB pan | wheel zoom | double-click fit"); hint.setStyleSheet("color:#8aa;"); bar.addWidget(hint)
+        sp = QSplitter(Qt.Horizontal); lay.addWidget(sp, 1)
+        # left panel
+        lw = QWidget(); ll = QVBoxLayout(lw); ll.setContentsMargins(0, 0, 0, 0)
+        lh = QHBoxLayout(); ll.addLayout(lh); lh.addWidget(QLabel("<b>Geometric Mesh</b>"))
+        self.mode = QComboBox(); self.mode.addItems(["Solid", "Wireframe", "Solid + Wire"]); lh.addWidget(self.mode)
+        self.c_norm = QCheckBox("Normals"); self.c_axes = QCheckBox("Axes"); self.c_axes.setChecked(True)
+        self.c_bbox = QCheckBox("Bounding box"); self.c_bbox.setChecked(True)
+        for w in (self.c_norm, self.c_axes, self.c_bbox): lh.addWidget(w)
+        lh.addStretch(1); ll.addWidget(self.left, 1); sp.addWidget(lw)
+        # right panel
+        rw = QWidget(); rl = QVBoxLayout(rw); rl.setContentsMargins(0, 0, 0, 0)
+        rh = QHBoxLayout(); rl.addLayout(rh); rh.addWidget(QLabel("<b>Real-World Reconstruction</b>"))
+        self.cmode = QComboBox(); self.cmode.addItems(["RGB colour", "Depth colour"]); rh.addWidget(self.cmode)
+        self.c_surf = QCheckBox("Coloured surface"); rh.addWidget(self.c_surf)
+        rh.addWidget(QLabel("Point size")); self.psize = QSlider(Qt.Horizontal); self.psize.setRange(1, 12)
+        self.psize.setValue(3); self.psize.setMaximumWidth(120); rh.addWidget(self.psize); rh.addStretch(1)
+        rl.addWidget(self.right, 1); sp.addWidget(rw); sp.setSizes([1, 1])
+        # wiring
+        self.mode.currentIndexChanged.connect(self._opts); self.c_norm.toggled.connect(self._opts)
+        self.c_axes.toggled.connect(self._opts); self.c_bbox.toggled.connect(self._opts)
+        self.cmode.currentIndexChanged.connect(self._opts); self.c_surf.toggled.connect(self._opts)
+        self.psize.valueChanged.connect(self._opts)
+        self.left.cam.user_changed.connect(lambda: self._sync(self.left, self.right))
+        self.right.cam.user_changed.connect(lambda: self._sync(self.right, self.left))
+        self.left.activated.connect(lambda: setattr(self, "active", self.left))
+        self.right.activated.connect(lambda: setattr(self, "active", self.right))
+        self.sync.toggled.connect(lambda on: on and self.right.cam.set_state(self.left.cam.state()))
+        self._opts()
+
+    def _sync(self, src, dst):
+        if self.sync.isChecked(): dst.cam.set_state(src.cam.state())
+    def _apply(self, fn):
+        fn(self.active.cam); self.active.cam.changed.emit(); self.active.cam.user_changed.emit()
+    def _view(self, name):
+        c, r = self.left.center_radius(); self._apply(lambda cam: cam.view(name, c, r))
+    def _opts(self):
+        l, r = self.left, self.right
+        l.mesh_mode = ["solid", "wire", "both"][self.mode.currentIndex()]; l.show_normals = self.c_norm.isChecked()
+        l.show_axes = r.show_axes = self.c_axes.isChecked(); l.show_bbox = r.show_bbox = self.c_bbox.isChecked()
+        r.depth_mode = self.cmode.currentIndex() == 1; r.show_mesh = self.c_surf.isChecked()
+        r.mesh_mode = "solid"; r.mesh_colored = True; r.point_size = float(self.psize.value())
+        l.update(); r.update()
+
+    def set_result(self, res: ReconResult):
+        self.result = res; m = res.mesh
+        V = np.asarray(m.vertices); F = np.asarray(m.triangles); N = np.asarray(m.vertex_normals)
+        C = np.asarray(m.vertex_colors) if m.has_vertex_colors() else None
+        P = np.asarray(res.cloud.points); Cc = np.asarray(res.cloud.colors)
+        for v in (self.left, self.right): v.set_mesh(V, F, N, C)
+        self.left.set_points(P, Cc); self.right.set_points(P, Cc)
+        self.left.bmin = self.right.bmin = V.min(0); self.left.bmax = self.right.bmax = V.max(0)
+        self.left.show_points = False
+        e = (V.max(0) - V.min(0)) * 1000; st = res.stats
+        self.left.set_info(f"Vertices {st['vertices']:,}   Triangles {st['triangles']:,}\n"
+                           f"BBox (axis-aligned) X {e[0]:.1f} x Y {e[1]:.1f} x Z {e[2]:.1f} mm\nAxes: X red, Y green, Z blue")
+        self.right.set_info(f"Points {st['points']:,}   Keyframes {st['keyframes']}   Loop closures {st.get('loop_closures', 0)}\n"
+                            f"Voxel {st['voxel_mm']} mm   Mean reg. fitness {st['mean_fitness']}\n"
+                            f"Mesh watertight: {'yes' if st['watertight'] else 'NO - unobserved surfaces remain open'}")
+        self._view("iso")
+
+
+# =====================================================================================
+# GUI helpers
+# =====================================================================================
+class ImageView(QLabel):
+    clicked = Signal(int, int)
+    def __init__(self, title=""):
+        super().__init__(title); self.setAlignment(Qt.AlignCenter); self.setMinimumSize(160, 120)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.setStyleSheet("background:#000;color:#667;"); self._shape = None
+    def set_image(self, bgr):
+        h, w = bgr.shape[:2]; self._shape = (h, w)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        q = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+        self.setPixmap(QPixmap.fromImage(q).scaled(self.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
+    def mousePressEvent(self, e):
+        pm = self.pixmap()
+        if pm is None or self._shape is None or pm.width() == 0: return
+        ox = (self.width() - pm.width()) / 2; oy = (self.height() - pm.height()) / 2
+        x = (e.position().x() - ox) * self._shape[1] / pm.width(); y = (e.position().y() - oy) * self._shape[0] / pm.height()
+        if 0 <= x < self._shape[1] and 0 <= y < self._shape[0]: self.clicked.emit(int(x), int(y))
+
+
+def dspin(lo, hi, val, step, dec=2, suffix=""):
+    w = QDoubleSpinBox(); w.setRange(lo, hi); w.setDecimals(dec); w.setSingleStep(step); w.setValue(val); w.setSuffix(suffix); return w
+
+
+DARK_QSS = """
+QWidget{background:#14171c;color:#d5dde6;font-size:12px}
+QGroupBox{border:1px solid #2b323c;border-radius:5px;margin-top:10px;padding-top:8px;font-weight:bold}
+QGroupBox::title{subcontrol-origin:margin;left:8px;color:#5aa9e6}
+QPushButton{background:#232a33;border:1px solid #38424f;border-radius:4px;padding:5px 9px}
+QPushButton:hover{background:#2d3743} QPushButton:disabled{color:#566;background:#1a1f26}
+QPushButton#primary{background:#1f5f99;border-color:#2b7bc2}
+QPushButton#danger{background:#7a2b2b;border-color:#a33}
+QLineEdit,QSpinBox,QDoubleSpinBox,QComboBox,QPlainTextEdit{background:#0f1216;border:1px solid #2f3742;border-radius:3px;padding:2px}
+QProgressBar{border:1px solid #2f3742;border-radius:3px;text-align:center;background:#0f1216}
+QProgressBar::chunk{background:#2b7bc2}
+QTabBar::tab{background:#1b2027;padding:7px 16px;border:1px solid #2b323c} QTabBar::tab:selected{background:#252d38;color:#5aa9e6}
+QSplitter::handle{background:#2b323c}
+"""
+
+
+# =====================================================================================
+# Main window
+# =====================================================================================
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE); self.resize(1500, 900)
+        self.settings = Settings(); self.session = ScanSession(); self.hub = FrameHub()
+        self.cam_ok = False; self.last_res: Optional[DetectionResult] = None; self.result: Optional[ReconResult] = None
+        self.recon: Optional[ReconWorker] = None; self._was_max = False; self._seen_err = {}
+        self._warned_ack = False; self.proj_info = {}
+        self._build_ui()
+        self.cam = CameraThread(self.hub); self.cam.status.connect(self._cam_status); self.cam.start()
+        self.perc = PerceptionWorker(self.hub, self.session, self.settings)
+        self.perc.detections.connect(self._on_det); self.perc.live_cloud.connect(self._on_cloud)
+        self.perc.scan_update.connect(self._on_scan); self.perc.status.connect(lambda m: self.log("info", m))
+        self.perc.error.connect(lambda m: self.log("error", m)); self.perc.start()
+        self.timer = QTimer(self); self.timer.timeout.connect(self._tick); self.timer.start(66)
+        self.refresh_ui()
+
+    # ---- UI construction --------------------------------------------------------------
+    def _build_ui(self):
+        tabs = QTabWidget(); self.tabs = tabs; self.setCentralWidget(tabs)
+        scan = QWidget(); tabs.addTab(scan, "Scan"); sl = QHBoxLayout(scan)
+        # control column
+        col = QWidget(); cl = QVBoxLayout(col); sc = QScrollArea(); sc.setWidget(col); sc.setWidgetResizable(True); sc.setFixedWidth(370)
+        sl.addWidget(sc)
+        g = QGroupBox("Status"); f = QFormLayout(g)
+        self.l_cam = QLabel("Starting camera..."); self.l_cam.setWordWrap(True)
+        self.l_stage = QLabel("-"); self.l_det = QLabel("-"); self.l_det.setWordWrap(True)
+        self.l_counts = QLabel("-"); self.l_track = QLabel("-"); self.l_track.setWordWrap(True)
+        self.l_model = QLabel("-"); self.l_model.setWordWrap(True)
+        for k, w in (("Camera", self.l_cam), ("Stage", self.l_stage), ("Detection", self.l_det), ("Frames", self.l_counts),
+                     ("Tracking", self.l_track), ("Model", self.l_model)): f.addRow(k, w)
+        cl.addWidget(g)
+        g = QGroupBox("Scan controls"); gl_ = QGridLayout(g)
+        def btn(text, fn, name=None):
+            b = QPushButton(text); b.clicked.connect(fn)
+            if name: b.setObjectName(name)
+            return b
+        self.b_start = btn("Start Scan", self.on_start, "primary"); self.b_pause = btn("Pause Scan", self.on_pause)
+        self.b_resume = btn("Resume Scan", self.on_resume); self.b_done = btn("All Sides Captured", self.on_captured, "primary")
+        self.b_review = btn("Review Scan", self.on_review); self.b_cont = btn("Continue Scanning", self.on_continue)
+        self.b_recon = btn("Reconstruct 3D Model", self.on_recon, "primary"); self.b_cancel = btn("Cancel Reconstruction", self.on_cancel, "danger")
+        self.b_reset = btn("Reset Scan", self.on_reset, "danger")
+        for i, b in enumerate([self.b_start, self.b_pause, self.b_resume, self.b_done, self.b_review, self.b_cont,
+                               self.b_recon, self.b_cancel]): gl_.addWidget(b, i // 2, i % 2)
+        gl_.addWidget(self.b_reset, 4, 0, 1, 2); cl.addWidget(g)
+        g = QGroupBox("Reconstruction progress"); v = QVBoxLayout(g)
+        self.pbar = QProgressBar(); self.pbar.setRange(0, 1000); self.pbar.setValue(0); self.l_prog = QLabel("Idle")
+        v.addWidget(self.l_prog); v.addWidget(self.pbar); cl.addWidget(g)
+        g = QGroupBox("Project / export"); v = QVBoxLayout(g)
+        self.b_save = btn("Save Project...", self.on_save); self.b_load = btn("Load Project...", self.on_load)
+        self.b_export = btn("Export Model...", self.on_export)
+        for b in (self.b_save, self.b_load, self.b_export): v.addWidget(b)
+        cl.addWidget(g)
+        g = QGroupBox("Settings"); f = QFormLayout(g); s = self.settings
+        def bind(w, attr, label):
+            w.valueChanged.connect(lambda val, a=attr: setattr(self.settings, a, val)); f.addRow(label, w); return w
+        bind(dspin(0.05, 1.0, s.yolo_conf, 0.05), "yolo_conf", "YOLO confidence")
+        sb_infer = QSpinBox()
+        sb_infer.setRange(0, 2000)
+        sb_infer.setValue(s.infer_interval_ms)
+        bind(sb_infer, "infer_interval_ms", "Idle inference (ms)")
+        bind(dspin(0.04, 1.0, s.depth_min_m, 0.01, 2, " m"), "depth_min_m", "Depth min")
+        bind(dspin(0.1, 2.0, s.depth_max_m, 0.05, 2, " m"), "depth_max_m", "Depth max")
+        bind(dspin(0.5, 10, s.live_voxel_mm, 0.5, 1, " mm"), "live_voxel_mm", "Live voxel")
+        bind(dspin(0.4, 5, s.recon_voxel_mm, 0.1, 1, " mm"), "recon_voxel_mm", "Recon voxel")
+        bind(dspin(2, 30, s.kf_angle_deg, 1, 1, " deg"), "kf_angle_deg", "Keyframe angle")
+        bind(dspin(0.5, 10, s.kf_trans_cm, 0.5, 1, " cm"), "kf_trans_cm", "Keyframe shift")
+        bind(dspin(0.1, 0.9, s.min_fitness, 0.05), "min_fitness", "Min reg. fitness")
+        self.e_w = QLineEdit(s.yolo_weights); self.e_w.editingFinished.connect(self._weights); f.addRow("YOLO weights", self.e_w)
+        self.cb_units = QComboBox(); self.cb_units.addItems(["m", "mm"]); self.cb_units.currentTextChanged.connect(lambda t: setattr(self.settings, "export_units", t))
+        f.addRow("Export units", self.cb_units); cl.addWidget(g); cl.addStretch(1)
+        # main area
+        vs = QSplitter(Qt.Vertical); sl.addWidget(vs, 1)
+        top = QSplitter(Qt.Horizontal); vs.addWidget(top)
+        self.v_rgb = ImageView("RGB (click a bottle to select it)"); self.v_depth = ImageView("Depth")
+        self.v_rgb.clicked.connect(lambda x, y: setattr(self.perc, "select_point", (x, y))); top.addWidget(self.v_rgb); top.addWidget(self.v_depth)
+        bot = QSplitter(Qt.Horizontal); vs.addWidget(bot)
+        lw = QWidget(); ll = QVBoxLayout(lw); ll.setContentsMargins(0, 0, 0, 0)
+        hb = QHBoxLayout(); hb.addWidget(QLabel("<b>Live segmented point cloud</b>")); rb = QPushButton("Reset View")
+        rb.clicked.connect(lambda: (self.live.fit_view(), setattr(self.live, "user_touched", False))); hb.addWidget(rb); hb.addStretch(1)
+        ll.addLayout(hb); self.live = GLViewport(); self.live.point_size = 2.0; ll.addWidget(self.live, 1); bot.addWidget(lw)
+        self.logbox = QPlainTextEdit(); self.logbox.setReadOnly(True); self.logbox.setMaximumBlockCount(500); bot.addWidget(self.logbox)
+        bot.setSizes([800, 400]); vs.setSizes([380, 480])
+        self.insp = InspectionTab(); self.tabs.addTab(self.insp, "Inspection"); self.tabs.setTabEnabled(1, False)
+        # menu / shortcuts
+        m = self.menuBar().addMenu("&View")
+        for text, fn, key in (("Full Screen", self.toggle_fs, "F11"), ("Maximized", self.showMaximized, None), ("Windowed", self.showNormal, None)):
+            a = QAction(text, self); a.triggered.connect(fn)
+            if key: a.setShortcut(QKeySequence(key))
+            m.addAction(a)
+        QShortcut(QKeySequence("Escape"), self, activated=lambda: self.isFullScreen() and self.toggle_fs())
+        self.statusBar().showMessage("Ready")
+
+    def toggle_fs(self):
+        if self.isFullScreen(): self.showMaximized() if self._was_max else self.showNormal()
+        else: self._was_max = self.isMaximized(); self.showFullScreen()
+
+    def _weights(self):
+        self.settings.yolo_weights = self.e_w.text().strip() or "yolov8n-seg.pt"; self.perc.reload = True
+
+    def log(self, level, msg):
+        key = (level, msg)
+        if time.time() - self._seen_err.get(key, 0) < 5: return
+        self._seen_err[key] = time.time()
+        formatted = f"[{time.strftime('%H:%M:%S')}] {level.upper()}: {msg}"
+        self.logbox.appendPlainText(formatted)
+        print(formatted, flush=True)
+
+    # ---- slots ------------------------------------------------------------------------
+    def _cam_status(self, msg, ok):
+        self.cam_ok = ok; self.l_cam.setText(msg); self.log("info" if ok else "warn", msg); self.refresh_ui()
+    def _on_det(self, res: DetectionResult):
+        self.last_res = res
+        if res.target is not None and res.distance_m:
+            d = res.dets[res.target]; self.l_det.setText(f"bottle conf {d.conf:.2f} | distance {res.distance_m*100:.1f} cm | {res.valid_px} valid px")
+        else: self.l_det.setText(res.message or "-")
+    def _on_cloud(self, P, C):
+        P = P * np.array([1, -1, -1], np.float32)
+        self.live.set_points(P, C)
+        if not self.live.user_touched: self.live.fit_view()
+        self.l_model.setText(f"Live cloud: {len(P):,} points") if self.session.state != ScanState.DONE else None
+    def _on_scan(self, d):
+        self.l_counts.setText(f"processed {d['seen']} | accepted {d['accepted']} | rejected track {d['rej_track']} / quality {d['rej_quality']}")
+        self.l_track.setText(d["status"]); self.refresh_ui()
+    def _tick(self):
+        f = self.hub.peek()
+        if f is None: return
+        self.v_rgb.set_image(draw_overlay(f.color, self.last_res, self.session.state))
+        self.v_depth.set_image(colorize_depth(f.depth, f.units, self.settings.depth_min_m, self.settings.depth_max_m))
+
+    def refresh_ui(self):
+        se = self.session; st = se.state; n = len(se.keyframes); cam = self.cam_ok
+        self.b_start.setEnabled(cam and st in (ScanState.IDLE, ScanState.DONE))
+        self.b_pause.setEnabled(st == ScanState.SCANNING); self.b_resume.setEnabled(st == ScanState.PAUSED and cam)
+        self.b_done.setEnabled(st in (ScanState.SCANNING, ScanState.PAUSED) and n > 0)
+        self.b_review.setEnabled(n > 0 and st != ScanState.RECONSTRUCTING)
+        self.b_cont.setEnabled(st == ScanState.CAPTURED and cam)
+        self.b_recon.setEnabled(st in (ScanState.CAPTURED, ScanState.DONE) and n > 0)
+        self.b_cancel.setEnabled(st == ScanState.RECONSTRUCTING); self.b_reset.setEnabled(st != ScanState.RECONSTRUCTING)
+        self.b_save.setEnabled(self.result is not None and st != ScanState.RECONSTRUCTING)
+        self.b_export.setEnabled(self.result is not None); self.b_load.setEnabled(st != ScanState.RECONSTRUCTING)
+        stage = {"Idle": "1-2: Detection & live point cloud", "Scanning": "3: Multi-view scanning", "Paused": "3: Scan paused",
+                 "Captured (locked)": "3: Captured - review / reconstruct", "Reconstructing": "3: Reconstruction", "Done": "4: Inspection"}
+        self.l_stage.setText(stage[st.value])
+
+    # ---- scan actions -----------------------------------------------------------------
+    def on_start(self):
+        if not (self.last_res and self.last_res.target is not None and self.last_res.valid_px >= self.settings.min_object_px):
+            QMessageBox.warning(self, APP_TITLE, "A bottle with enough valid depth must be detected first.\n"
+                                "Bring the bottle into the D405 range and click it in the RGB view."); return
+        if self.session.keyframes and QMessageBox.question(self, APP_TITLE, "Discard previously captured keyframes and start a new scan?") != QMessageBox.Yes: return
+        self.session.reset(); self._warned_ack = False
+        with self.session.lock: self.session.state = ScanState.SCANNING; self.session.status = "Waiting for first keyframe"
+        self.log("info", "Scan started. Move the camera slowly around the stationary bottle."); self.refresh_ui()
+    def on_pause(self):
+        with self.session.lock: self.session.state = ScanState.PAUSED
+        self.refresh_ui()
+    def on_resume(self):
+        with self.session.lock: self.session.state = ScanState.SCANNING; self.session.status = "Resumed - return to the last captured view if tracking fails"
+        self.refresh_ui()
+    def on_continue(self): self.on_resume()
+    def on_captured(self):
+        with self.session.lock: self.session.state = ScanState.CAPTURED     # worker only appends while SCANNING
+        self.refresh_ui(); self.on_review(offer=True)
+    def on_review(self, offer=False):
+        with self.session.lock: kfs = list(self.session.keyframes); intr = self.session.intr; units = self.session.units
+        if not kfs: return
+        msgs, info = review_keyframes(kfs, intr, units, self.settings)
+        self.proj_info["review"] = dict(info=info, messages=msgs)
+        text = "\n".join(f"[{l.upper()}] {m}" for l, m in msgs) + f"\n\nSummary: {json.dumps(info)}"
+        for l, m in msgs: self.log(l, m)
+        box = QMessageBox(self); box.setWindowTitle("Scan review"); box.setText(text)
+        bc = box.addButton("Continue Scanning", QMessageBox.ActionRole) if offer else None
+        br = box.addButton("Reconstruct Now", QMessageBox.AcceptRole) if offer and not any(l == "error" for l, _ in msgs) else None
+        box.addButton("Close", QMessageBox.RejectRole); box.exec()
+        if bc is not None and box.clickedButton() == bc: self.on_continue()
+        elif br is not None and box.clickedButton() == br: self._warned_ack = True; self.on_recon()
+    def on_reset(self):
+        if QMessageBox.question(self, APP_TITLE, "Discard all captured data and the reconstructed model?") != QMessageBox.Yes: return
+        self.session.reset(); self.result = None; self.insp.left.clear(); self.insp.right.clear()
+        self.tabs.setTabEnabled(1, False); self.l_counts.setText("-"); self.l_track.setText("-"); self.pbar.setValue(0); self.l_prog.setText("Idle")
+        self.refresh_ui()
+
+    # ---- reconstruction ---------------------------------------------------------------
+    def on_recon(self):
+        with self.session.lock:
+            if self.session.state not in (ScanState.CAPTURED, ScanState.DONE): return
+            kfs = list(self.session.keyframes); intr = self.session.intr; units = self.session.units
+        msgs, _ = review_keyframes(kfs, intr, units, self.settings)
+        if any(l == "error" for l, _ in msgs): QMessageBox.warning(self, APP_TITLE, "\n".join(m for l, m in msgs if l == "error")); return
+        if not self._warned_ack and any(l == "warn" for l, _ in msgs):
+            if QMessageBox.question(self, APP_TITLE, "Review found warnings:\n\n" + "\n".join(m for l, m in msgs if l == "warn") +
+                                    "\n\nReconstruct anyway? Unobserved surfaces will remain open/missing.") != QMessageBox.Yes: return
+        with self.session.lock: self.session.state = ScanState.RECONSTRUCTING
+        self.recon = ReconWorker(kfs, intr, units, self.settings)
+        self.recon.progress.connect(self._rprog); self.recon.finished_ok.connect(self._rdone)
+        self.recon.failed.connect(self._rfail); self.recon.cancelled.connect(self._rcancel); self.recon.start(); self.refresh_ui()
+    def _rprog(self, stage, frac): self.l_prog.setText(stage); self.pbar.setValue(int(frac * 1000))
+    def _end_recon(self, state):
+        with self.session.lock: self.session.state = state
+        self.recon = None; self.refresh_ui()
+    def _rdone(self, res: ReconResult):
+        self.result = res; self.insp.set_result(res); self.tabs.setTabEnabled(1, True); self.tabs.setCurrentIndex(1)
+        st = res.stats; self.l_model.setText(f"Mesh {st['vertices']:,} v / {st['triangles']:,} tri | cloud {st['points']:,} pts | "
+                                             f"{st['bbox_mm'][0]}x{st['bbox_mm'][1]}x{st['bbox_mm'][2]} mm")
+        self.l_prog.setText("Reconstruction finished"); self.pbar.setValue(1000)
+        if not st["watertight"]: self.log("warn", "Mesh is not watertight: surfaces that were never observed are NOT filled in.")
+        self._end_recon(ScanState.DONE)
+    def _rfail(self, tb): self.log("error", "Reconstruction failed:\n" + tb); self.l_prog.setText("Failed"); self.pbar.setValue(0)
+    def _after_fail(self): pass
+    def _rcancel(self): self.l_prog.setText("Cancelled"); self.pbar.setValue(0); self._end_recon(ScanState.CAPTURED)
+    def on_cancel(self):
+        if self.recon: self.recon.cancel(); self.l_prog.setText("Cancelling...")
+
+    # ---- project / export -------------------------------------------------------------
+    def on_export(self):
+        if self.result is None: return
+        flt = "Mesh PLY (*.ply);;Mesh OBJ (*.obj);;Mesh STL (*.stl);;Point cloud PLY (*.ply)"
+        path, sel = QFileDialog.getSaveFileName(self, "Export model", "bottle", flt)
+        if not path: return
+        try:
+            k = 1000.0 if self.settings.export_units == "mm" else 1.0
+            S = np.diag([k, k, k, 1.0])
+            if sel.startswith("Point cloud"):
+                pc = o3d.geometry.PointCloud(self.result.cloud); pc.transform(S)
+                if not path.lower().endswith(".ply"): path += ".ply"
+                ok = o3d.io.write_point_cloud(path, pc)
+            else:
+                m = o3d.geometry.TriangleMesh(self.result.mesh); m.transform(S); m.compute_vertex_normals()
+                ext = ".stl" if "STL" in sel else ".obj" if "OBJ" in sel else ".ply"
+                if not path.lower().endswith(ext): path += ext
+                if ext == ".stl": m.compute_triangle_normals()
+                ok = o3d.io.write_triangle_mesh(path, m)
+            if not ok: raise RuntimeError("Open3D reported a write failure")
+            self.log("info", f"Exported {path} (units: {self.settings.export_units})")
+        except Exception as e:
+            QMessageBox.critical(self, APP_TITLE, f"Export failed: {e}")
+    def on_save(self):
+        if self.result is None: return
+        d = QFileDialog.getExistingDirectory(self, "Choose / create project folder")
+        if not d: return
+        try:
+            se = self.session
+            with se.lock: kfs = list(se.keyframes); intr = se.intr; units = se.units
+            meta = dict(format=1, app=APP_TITLE, saved=time.strftime("%Y-%m-%d %H:%M:%S"), units="m",
+                        frame="model frame: world(first camera) rotated 180deg about X, bbox centre at origin",
+                        model_transform=self.result.model_transform.tolist(), stats=self.result.stats,
+                        settings=dataclasses.asdict(self.settings), intrinsics=intr, depth_units=units,
+                        review=self.proj_info.get("review"), keyframe_poses=[k.pose.tolist() for k in kfs],
+                        keyframe_fitness=[k.fitness for k in kfs])
+            with open(os.path.join(d, "project.json"), "w") as fh: json.dump(meta, fh, indent=1, default=str)
+            o3d.io.write_triangle_mesh(os.path.join(d, "mesh.ply"), self.result.mesh)
+            o3d.io.write_point_cloud(os.path.join(d, "cloud.ply"), self.result.cloud)
+            if kfs and QMessageBox.question(self, APP_TITLE, "Also save raw RGB-D keyframes (large) so reconstruction can be re-run with other settings?") == QMessageBox.Yes:
+                arr = {}
+                for i, k in enumerate(kfs): arr[f"c{i}"] = k.color_rgb; arr[f"d{i}"] = k.depth_obj
+                np.savez_compressed(os.path.join(d, "keyframes.npz"), **arr)
+            self.log("info", f"Project saved to {d}")
+        except Exception as e: QMessageBox.critical(self, APP_TITLE, f"Save failed: {e}")
+    def on_load(self):
+        d = QFileDialog.getExistingDirectory(self, "Open project folder")
+        if not d: return
+        try:
+            with open(os.path.join(d, "project.json")) as fh: meta = json.load(fh)
+            mesh = o3d.io.read_triangle_mesh(os.path.join(d, "mesh.ply")); cloud = o3d.io.read_point_cloud(os.path.join(d, "cloud.ply"))
+            if len(mesh.triangles) == 0: raise RuntimeError("mesh.ply is empty")
+            mesh.compute_vertex_normals()
+            self.session.reset(); self.result = ReconResult(mesh, cloud, meta["stats"], np.array(meta["model_transform"]))
+            npz = os.path.join(d, "keyframes.npz")
+            if os.path.exists(npz) and meta.get("intrinsics"):
+                z = np.load(npz); poses = meta["keyframe_poses"]; fit = meta.get("keyframe_fitness", [1.0] * len(poses))
+                with self.session.lock:
+                    self.session.keyframes = [Keyframe(z[f"c{i}"], z[f"d{i}"], np.array(poses[i]), fit[i], 0.0, int((z[f"d{i}"] > 0).sum())) for i in range(len(poses))]
+                    self.session.intr = meta["intrinsics"]; self.session.units = meta["depth_units"]
+            with self.session.lock: self.session.state = ScanState.DONE
+            self.insp.set_result(self.result); self.tabs.setTabEnabled(1, True); self.tabs.setCurrentIndex(1)
+            self.log("info", "Project loaded. Live tracking state is not restorable; scanning cannot be continued "
+                              "(re-reconstruction is possible only if raw keyframes were saved).")
+            self.refresh_ui()
+        except Exception as e: QMessageBox.critical(self, APP_TITLE, f"Load failed: {e}")
+
+    # ---- shutdown ---------------------------------------------------------------------
+    def closeEvent(self, ev):
+        self.timer.stop()
+        if self.recon: self.recon.cancel(); self.recon.wait(10000)
+        self.perc.stop(); self.perc.wait(10000)
+        self.cam.stop(); self.cam.wait(10000)
+        ev.accept()
+
+
+def main():
+    print("Initializing Qt SurfaceFormat...", flush=True)
+    fmt = QSurfaceFormat(); fmt.setDepthBufferSize(24); fmt.setSamples(4); fmt.setVersion(2, 1)
+    fmt.setProfile(QSurfaceFormat.CompatibilityProfile); QSurfaceFormat.setDefaultFormat(fmt)
+    print("Creating QApplication...", flush=True)
+    app = QApplication(sys.argv); app.setStyle("Fusion"); app.setStyleSheet(DARK_QSS)
+    missing = [n for n, m in (("open3d", o3d), ("PyOpenGL", gl)) if m is None]
+    if missing:
+        print(f"Missing packages: {missing}", flush=True)
+        QMessageBox.critical(None, APP_TITLE, "Missing required packages: " + ", ".join(missing) + "\nSee requirements.txt."); return 1
+    print("Creating MainWindow...", flush=True)
+    w = MainWindow()
+    print("Showing MainWindow...", flush=True)
+    w.showMaximized()
+    print("Entering Qt event loop (app.exec)...", flush=True)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
